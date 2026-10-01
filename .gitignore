@@ -19,3 +19,19 @@ coverage/
 .env
 .env.*
 !.env.example
+
+# Local agent state and execution output
+.agent/state/
+.agent/worktrees/
+.codex/state/
+.codex/*.local.toml
+*.log
+
+# Local databases and credentials
+*.db
+*.sqlite
+*.sqlite3
+*.pem
+*.key
+*.p12
+*.pfx

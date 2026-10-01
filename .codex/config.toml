@@ -1,0 +1,13 @@
+# Repository Codex baseline for ordinary isolated implementation workers.
+# This is execution configuration, not canonical product or planning state.
+# Verify with the installed Codex CLI using --strict-config before changing it.
+
+sandbox_mode = "workspace-write"
+approval_policy = "never"
+web_search = "disabled"
+
+[sandbox_workspace_write]
+network_access = false
+
+[features]
+apps = false

@@ -1,0 +1,26 @@
+# This file is non-canonical execution metadata.
+# Canonical design and implementation-plan artifacts live at their registered
+# Project Library paths. Do not use this file as a competing source of truth.
+
+phase: "NN"
+status: "GREENLIGHT"
+
+design:
+  canonical_path: "<canonical Project Library path>"
+  review_round: "R3"
+
+implementation_plan:
+  canonical_path: "<canonical Project Library path>"
+  review_round: "R3"
+
+repository:
+  remote: "github.com/<owner>/<repository>"
+  branch: "main"
+  pinned_sha: "<full 40-character commit SHA>"
+
+execution:
+  integration_branch: "phase/NN-short-description"
+
+  tasks:
+    - id: "PNN-T01"
+      description: "<accepted task description>"

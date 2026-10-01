@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${RAP_REPO_ROOT:-$(cd -- "$SCRIPT_DIR/.." && pwd)}"
+
+printf 'Repository bootstrap check: %s\n' "$ROOT"
+
+for command_name in bash git awk sed grep; do
+  command -v "$command_name" >/dev/null 2>&1 \
+    || { printf 'ERROR: required local command is missing: %s\n' "$command_name" >&2; exit 1; }
+done
+
+if command -v codex >/dev/null 2>&1; then
+  printf 'Codex: '
+  codex --version | tail -n 1
+else
+  printf 'Codex: not found (install explicitly before launching workers)\n'
+fi
+
+if find "$ROOT" -type f \( -name '*.sln' -o -name '*.csproj' \) -print -quit | grep -q .; then
+  command -v dotnet >/dev/null 2>&1 \
+    || { printf 'ERROR: .NET project detected but dotnet is missing\n' >&2; exit 1; }
+  printf 'Toolchain: .NET detected (%s)\n' "$(dotnet --version)"
+else
+  printf 'Toolchain: no .NET solution/project detected\n'
+fi
+
+if [[ -f "$ROOT/package.json" ]]; then
+  if [[ -f "$ROOT/pnpm-lock.yaml" ]]; then
+    package_manager=pnpm
+  elif [[ -f "$ROOT/yarn.lock" ]]; then
+    package_manager=yarn
+  else
+    package_manager=npm
+  fi
+  command -v "$package_manager" >/dev/null 2>&1 \
+    || { printf 'ERROR: package.json detected but %s is missing\n' "$package_manager" >&2; exit 1; }
+  printf 'Toolchain: JavaScript package manager %s detected\n' "$package_manager"
+else
+  printf 'Toolchain: no package.json detected\n'
+fi
+
+printf '\nNo dependencies were installed. Ordinary Codex workers run with network disabled.\n'
+printf 'Use an explicit, coordinator-approved setup operation for dependency installation.\n'

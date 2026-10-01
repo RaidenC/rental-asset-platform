@@ -1,0 +1,7 @@
+# Coordinator-owned control-plane paths. Product workers should escalate
+# required changes instead of modifying these opportunistically.
+/AGENTS.md @RaidenC
+/.agent/ @RaidenC
+/.codex/ @RaidenC
+/.github/ @RaidenC
+/scripts/ @RaidenC

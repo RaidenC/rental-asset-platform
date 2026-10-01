@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+failures=()
+warnings=()
+
+check() {
+  local label="$1"
+  shift
+  printf '== %s ==\n' "$label"
+  if "$@"; then
+    printf 'PASS: %s\n' "$label"
+  else
+    printf 'FAIL: %s\n' "$label" >&2
+    failures+=("$label")
+  fi
+}
+
+require_git_repo
+
+required_governance_files() {
+  test -f "$REPO_ROOT/AGENTS.md" &&
+    test -f "$REPO_ROOT/.codex/config.toml" &&
+    test -f "$REPO_ROOT/.agent/execution/phase-NN.yaml.example" &&
+    test -x "$REPO_ROOT/scripts/bootstrap" &&
+    test -x "$REPO_ROOT/scripts/phase-preflight" &&
+    test -x "$REPO_ROOT/scripts/agent-worktree" &&
+    test -x "$REPO_ROOT/scripts/validate"
+}
+
+git_whitespace_check() {
+  git_at diff --check && git_at diff --cached --check
+}
+
+shell_syntax_check() {
+  local valid=true
+  while IFS= read -r -d '' script; do
+    if ! bash -n "$script"; then
+      valid=false
+    fi
+  done < <(find "$REPO_ROOT/scripts" -maxdepth 3 -type f \( \
+    -name '*.sh' -o -name 'bootstrap' -o -name 'validate' \
+    -o -name 'phase-preflight' -o -name 'agent-worktree' \
+  \) -print0)
+  [[ "$valid" == true ]]
+}
+
+tracked_secret_file_check() {
+  if git_at ls-files | grep -E '(^|/)(\.env($|\.)|.*\.(pem|key|p12|pfx)$)'; then
+    return 1
+  fi
+  return 0
+}
+
+codex_config_check() {
+  codex --strict-config --no-daemon -C "$REPO_ROOT" --help >/dev/null
+}
+
+check "required governance files" required_governance_files
+check "Git whitespace validation" git_whitespace_check
+check "shell syntax" shell_syntax_check
+check "tracked secret-shaped files" tracked_secret_file_check
+
+secret_hits=""
+if command -v rg >/dev/null 2>&1; then
+  secret_hits="$(rg -l --hidden \
+    -g '!.git/**' \
+    -g '!*.xlsx' \
+    -g '!*.Zone.Identifier' \
+    -e 'BEGIN (RSA|OPENSSH|EC|DSA|PGP) PRIVATE KEY' \
+    -e '\bAKIA[0-9A-Z]{16}\b' \
+    -e '\bgh[pousr]_[A-Za-z0-9_]{20,}\b' \
+    -e '\bgithub_pat_[A-Za-z0-9_]{20,}\b' \
+    -e '\bsk-[A-Za-z0-9]{20,}\b' \
+    -e "(aws_secret_access_key|client_secret|api_key|access_token)[[:space:]]*[:=][[:space:]]*[\"']?[A-Za-z0-9+/=_-]{20,}" \
+    -e 'postgres(ql)?://[^[:space:]]+:[^[:space:]@]+@' \
+    "$REPO_ROOT" || true)"
+fi
+if [[ -n "$secret_hits" ]]; then
+  printf 'Secret-shaped content detected in files:\n%s\n' "$secret_hits" >&2
+  failures+=("secret-shaped content scan")
+else
+  printf 'PASS: secret-shaped content scan\n'
+fi
+
+if command -v codex >/dev/null 2>&1; then
+  check "Codex project configuration syntax" codex_config_check
+else
+  warnings+=("codex is not installed; Codex config syntax was not verified")
+  printf 'WARN: codex is not installed; skipping Codex config syntax check\n'
+fi
+
+dotnet_projects="$(find "$REPO_ROOT" -type f \( -name '*.sln' -o -name '*.csproj' \) -print -quit)"
+if [[ -n "$dotnet_projects" ]]; then
+  if command -v dotnet >/dev/null 2>&1; then
+    check ".NET build" dotnet build --no-restore "$dotnet_projects"
+    check ".NET tests" dotnet test --no-build --no-restore "$dotnet_projects"
+  else
+    printf 'FAIL: .NET project detected but dotnet is unavailable\n' >&2
+    failures+=(".NET toolchain")
+  fi
+else
+  printf 'INFO: no .NET solution/project detected; .NET checks not applicable\n'
+fi
+
+if [[ -f "$REPO_ROOT/package.json" ]]; then
+  if [[ -f "$REPO_ROOT/pnpm-lock.yaml" ]]; then
+    package_manager=pnpm
+  elif [[ -f "$REPO_ROOT/yarn.lock" ]]; then
+    package_manager=yarn
+  else
+    package_manager=npm
+  fi
+  if command -v "$package_manager" >/dev/null 2>&1; then
+    check "JavaScript lint" "$package_manager" run lint --if-present
+    check "JavaScript typecheck" "$package_manager" run typecheck --if-present
+    check "JavaScript tests" "$package_manager" run test --if-present
+    check "JavaScript build" "$package_manager" run build --if-present
+  else
+    printf 'FAIL: package.json detected but %s is unavailable\n' "$package_manager" >&2
+    failures+=("JavaScript toolchain")
+  fi
+else
+  printf 'INFO: no package.json detected; JavaScript checks not applicable\n'
+fi
+
+if ((${#warnings[@]} > 0)); then
+  printf '\nWarnings:\n'
+  printf -- '- %s\n' "${warnings[@]}"
+fi
+
+if ((${#failures[@]} > 0)); then
+  printf '\nValidation failed:\n' >&2
+  printf -- '- %s\n' "${failures[@]}" >&2
+  exit 1
+fi
+
+printf '\nValidation passed.\n'

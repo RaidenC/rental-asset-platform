@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scripts/agent-worktree phase-create <phase-id>
+  scripts/agent-worktree create <phase-id> <task-id> <description>
+  scripts/agent-worktree list
+  scripts/agent-worktree remove <phase-id> <task-id> [--force]
+
+The default worktree root is ../<repo-name>-worktrees/<phase>/<task-id>.
+Set RAP_WORKTREE_ROOT to use an explicit coordinator-approved root.
+EOF
+}
+
+[[ $# -ge 1 ]] || { usage >&2; exit 2; }
+command_name="$1"
+shift
+require_git_repo
+
+worktree_root="${RAP_WORKTREE_ROOT:-$(dirname -- "$REPO_ROOT")/$(basename -- "$REPO_ROOT")-worktrees}"
+case "$worktree_root" in
+  "$REPO_ROOT"|"$REPO_ROOT"/*)
+    die "worktree root must be outside the repository: $worktree_root"
+    ;;
+esac
+
+manifest_value() {
+  local phase="$1"
+  local section="$2"
+  local key="$3"
+  yaml_scalar "$(phase_manifest "$phase")" "$section" "$key"
+}
+
+ensure_manifest_and_branch() {
+  local phase="$1"
+  local manifest="$(phase_manifest "$phase")"
+  [[ -f "$manifest" ]] || die "missing execution manifest: $manifest"
+  local integration_branch
+  integration_branch="$(manifest_value "$phase" execution integration_branch)"
+  [[ -n "$integration_branch" && "$integration_branch" != *"<"* ]] \
+    || die "manifest integration branch is missing or still a template placeholder"
+  git_at show-ref --verify --quiet "refs/heads/${integration_branch}" \
+    || die "phase integration branch does not exist: ${integration_branch}; run phase-create first"
+  printf '%s\n' "$integration_branch"
+}
+
+create_phase_branch() {
+  local phase="$1"
+  require_safe_component "phase-id" "$phase"
+  local manifest="$(phase_manifest "$phase")"
+  [[ -f "$manifest" ]] || die "missing execution manifest: $manifest"
+
+  "$REPO_ROOT/scripts/phase-preflight" "$phase" --allow-missing-integration
+
+  local reviewed_branch pinned_sha integration_branch current_branch
+  reviewed_branch="$(manifest_value "$phase" repository branch)"
+  pinned_sha="$(manifest_value "$phase" repository pinned_sha)"
+  integration_branch="$(manifest_value "$phase" execution integration_branch)"
+  current_branch="$(git_at branch --show-current)"
+
+  [[ "$current_branch" == "$reviewed_branch" ]] \
+    || die "phase branch creation must start from reviewed branch ${reviewed_branch}; current branch is ${current_branch}"
+  git_at show-ref --verify --quiet "refs/heads/${integration_branch}" \
+    && die "phase integration branch already exists: ${integration_branch}"
+  git_at branch "$integration_branch" "$pinned_sha"
+  printf 'PHASE_INTEGRATION_BRANCH_CREATED\n'
+  printf 'Phase: %s\nBranch: %s\nBase SHA: %s\n' "$phase" "$integration_branch" "$pinned_sha"
+}
+
+slugify() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' \
+    | cut -c1-48
+}
+
+create_task_worktree() {
+  local phase="$1"
+  local task_id="$2"
+  local description="$3"
+  require_safe_component "phase-id" "$phase"
+  require_safe_component "task-id" "$task_id"
+  [[ -n "$description" ]] || die "description must not be empty"
+
+  "$REPO_ROOT/scripts/phase-preflight" "$phase"
+  local integration_branch
+  integration_branch="$(ensure_manifest_and_branch "$phase")"
+  [[ -z "$(git_at status --porcelain)" ]] \
+    || die "coordinator worktree is dirty; refusing to create a task from ambiguous state"
+
+  local slug branch path phase_root
+  slug="$(slugify "$description")"
+  [[ -n "$slug" ]] || die "description cannot produce a safe branch slug"
+  branch="agent/${phase}-${task_id}-${slug}"
+  path="${worktree_root}/${phase}/${task_id}"
+  phase_root="${worktree_root}/${phase}"
+
+  git_at show-ref --verify --quiet "refs/heads/${branch}" \
+    && die "task branch already exists: ${branch}"
+  git_at show-ref --verify --quiet "refs/remotes/origin/${branch}" \
+    && die "remote task branch already exists: origin/${branch}"
+  [[ ! -e "$path" && ! -L "$path" ]] \
+    || die "worktree path already exists; refusing to overwrite: ${path}"
+
+  mkdir -p "$phase_root"
+  git_at worktree add -b "$branch" "$path" "$integration_branch"
+  printf 'AGENT_WORKTREE_CREATED\n'
+  printf 'Phase: %s\nTask: %s\nBranch: %s\nPath: %s\nBase: %s\n' \
+    "$phase" "$task_id" "$branch" "$path" "$integration_branch"
+}
+
+list_worktrees() {
+  git_at worktree list
+}
+
+remove_task_worktree() {
+  local phase="$1"
+  local task_id="$2"
+  local force=false
+  shift 2
+  while (($# > 0)); do
+    case "$1" in
+      --force) force=true ;;
+      *) die "unknown remove option: $1" ;;
+    esac
+    shift
+  done
+  require_safe_component "phase-id" "$phase"
+  require_safe_component "task-id" "$task_id"
+  local path="${worktree_root}/${phase}/${task_id}"
+  [[ -d "$path" ]] || die "worktree path does not exist: ${path}"
+
+  git_at worktree list --porcelain | awk -v expected="$path" '
+    /^worktree / && substr($0, 10) == expected { found = 1 }
+    END { exit found ? 0 : 1 }
+  ' || die "path is not a registered Git worktree: ${path}"
+
+  local dirty=""
+  dirty="$(git -C "$path" status --porcelain)"
+  if [[ -n "$dirty" ]]; then
+    [[ "$force" == true && "${RAP_HUMAN_DIRECTED_CLEANUP:-}" == "1" ]] \
+      || die "worktree has uncommitted work; clean it or use --force with RAP_HUMAN_DIRECTED_CLEANUP=1 after explicit human direction"
+    printf 'WARNING: explicitly approved dirty worktree removal: %s\n' "$path" >&2
+    git_at worktree remove --force "$path"
+  else
+    git_at worktree remove "$path"
+  fi
+  printf 'AGENT_WORKTREE_REMOVED\nPath: %s\nBranch retained: yes\n' "$path"
+}
+
+case "$command_name" in
+  phase-create)
+    (($# == 1)) || { usage >&2; exit 2; }
+    create_phase_branch "$1"
+    ;;
+  create)
+    (($# == 3)) || { usage >&2; exit 2; }
+    create_task_worktree "$1" "$2" "$3"
+    ;;
+  list)
+    (($# == 0)) || { usage >&2; exit 2; }
+    list_worktrees
+    ;;
+  remove)
+    (($# >= 2)) || { usage >&2; exit 2; }
+    remove_task_worktree "$@"
+    ;;
+  -h|--help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

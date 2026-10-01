@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/phase-preflight <phase-id> [--allow-missing-integration] [--allow-dirty]
+
+Validates a GREENLIGHT execution manifest, repository identity, pinned SHA,
+phase integration ancestry, coordinator branch context, and obvious drift.
+Exit 0 means the preflight passed. Exit 2 means execution is blocked or a
+PLAN_ESCALATION was emitted.
+EOF
+}
+
+[[ $# -ge 1 ]] || { usage >&2; exit 2; }
+phase="$1"
+shift
+allow_missing_integration=false
+allow_dirty=false
+while (($# > 0)); do
+  case "$1" in
+    --allow-missing-integration) allow_missing_integration=true ;;
+    --allow-dirty) allow_dirty=true ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf 'ERROR: unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+require_safe_component "phase-id" "$phase"
+require_git_repo
+
+manifest="$(phase_manifest "$phase")"
+if [[ ! -f "$manifest" ]]; then
+  printf 'EXECUTION_BLOCKED\n'
+  printf 'Reason: missing execution manifest\n'
+  printf 'Expected: %s\n' "$manifest"
+  exit 2
+fi
+
+errors=()
+escalation=false
+block() {
+  errors+=("$*")
+}
+
+required_value() {
+  local label="$1"
+  local value="$2"
+  if [[ -z "$value" || "$value" == *"<"* || "$value" == *">"* || "$value" == "NN" ]]; then
+    block "manifest ${label} is missing or still a template placeholder"
+  fi
+}
+
+manifest_phase="$(yaml_scalar "$manifest" "" phase)"
+status="$(yaml_scalar "$manifest" "" status)"
+design_path="$(yaml_scalar "$manifest" design canonical_path)"
+design_review="$(yaml_scalar "$manifest" design review_round)"
+plan_path="$(yaml_scalar "$manifest" implementation_plan canonical_path)"
+plan_review="$(yaml_scalar "$manifest" implementation_plan review_round)"
+expected_remote="$(yaml_scalar "$manifest" repository remote)"
+expected_branch="$(yaml_scalar "$manifest" repository branch)"
+pinned_sha="$(yaml_scalar "$manifest" repository pinned_sha)"
+integration_branch="$(yaml_scalar "$manifest" execution integration_branch)"
+
+required_value phase "$manifest_phase"
+required_value status "$status"
+required_value design.canonical_path "$design_path"
+required_value design.review_round "$design_review"
+required_value implementation_plan.canonical_path "$plan_path"
+required_value implementation_plan.review_round "$plan_review"
+required_value repository.remote "$expected_remote"
+required_value repository.branch "$expected_branch"
+required_value repository.pinned_sha "$pinned_sha"
+required_value execution.integration_branch "$integration_branch"
+
+[[ "$manifest_phase" == "$phase" ]] \
+  || block "manifest phase ${manifest_phase} does not match requested phase ${phase}"
+[[ "$status" == "GREENLIGHT" ]] \
+  || block "phase status is ${status}, expected GREENLIGHT"
+[[ "$pinned_sha" =~ ^[0-9a-fA-F]{40}$ ]] \
+  || block "repository.pinned_sha must be a full 40-character commit SHA"
+
+origin="$(git_at remote get-url origin 2>/dev/null || true)"
+if [[ -z "$origin" ]]; then
+  block "origin remote is not configured"
+elif [[ "$(normalize_remote "$origin")" != "$(normalize_remote "$expected_remote")" ]]; then
+  block "repository identity mismatch: manifest=${expected_remote}, origin=${origin}"
+fi
+
+current_branch="$(git_at branch --show-current)"
+current_sha="$(git_at rev-parse HEAD 2>/dev/null || true)"
+if [[ -z "$current_branch" ]]; then
+  block "preflight requires a named coordinator branch, not detached HEAD"
+fi
+if [[ "$current_branch" != "$expected_branch" && "$current_branch" != "$integration_branch" ]]; then
+  block "current branch ${current_branch} is neither reviewed branch ${expected_branch} nor phase integration branch ${integration_branch}"
+fi
+
+if [[ -n "$(git_at status --porcelain)" && "$allow_dirty" != true ]]; then
+  block "worktree is dirty; preflight will not reason over uncommitted state"
+fi
+
+if [[ "$pinned_sha" =~ ^[0-9a-fA-F]{40}$ ]] && ! git_at cat-file -e "${pinned_sha}^{commit}" 2>/dev/null; then
+  block "pinned SHA ${pinned_sha} is not present locally"
+fi
+
+if [[ -n "$current_sha" && "$pinned_sha" =~ ^[0-9a-fA-F]{40}$ ]] && \
+   ! git_at merge-base --is-ancestor "$pinned_sha" "$current_sha"; then
+  escalation=true
+  printf 'PLAN_ESCALATION\n\n'
+  printf 'Type: MATERIAL_REPO_DRIFT\n'
+  printf 'Phase: %s\nTask: <preflight>\n' "$phase"
+  printf 'Repository: %s\nExpected branch: %s\n' "$expected_remote" "$expected_branch"
+  printf 'Pinned SHA: %s\nCurrent SHA: %s\n\n' "$pinned_sha" "$current_sha"
+  printf 'Observed condition:\nCurrent history is not descended from the reviewed pinned SHA.\n\n'
+  printf 'Repository evidence:\n'
+  git_at log --oneline --decorate --max-count=8 "$current_sha" 2>/dev/null || true
+  printf '\nRelevant accepted-plan section:\nRepository pinning and drift handling.\n\n'
+  printf 'Why continuing would require changing or inventing semantics:\nThe reviewed repository state cannot be established.\n\n'
+fi
+
+if [[ -n "$current_sha" && "$current_sha" != "$pinned_sha" && \
+      "$pinned_sha" =~ ^[0-9a-fA-F]{40}$ ]] && \
+   git_at merge-base --is-ancestor "$pinned_sha" "$current_sha"; then
+  changed_paths="$(git_at diff --name-only "$pinned_sha" "$current_sha" || true)"
+  if [[ -n "$changed_paths" ]]; then
+    material_paths=""
+    while IFS= read -r changed_path; do
+      [[ -n "$changed_path" ]] || continue
+      case "$changed_path" in
+        docs/design-baseline/*|.codex/*|.github/*|AGENTS.md|scripts/*|src/*|app/*|apps/*|modules/*|db/*|database/*|migrations/*|api/*|auth/*|security/*|tenant/*|finance/*|package.json|package-lock.json|pnpm-lock.yaml|yarn.lock|*.sln|*.csproj|Directory.*|global.json)
+          material_paths+="${changed_path}\n"
+          ;;
+        .agent/execution/phase-*.yaml|docs/fixtures/*|docs/reviews/*|docs/*.md)
+          ;;
+        .agent/*)
+          material_paths+="${changed_path}\n"
+          ;;
+        *)
+          material_paths+="${changed_path}\n"
+          ;;
+      esac
+    done <<< "$changed_paths"
+
+    if [[ -n "$material_paths" ]]; then
+      escalation=true
+      printf 'PLAN_ESCALATION\n\n'
+      printf 'Type: MATERIAL_REPO_DRIFT\n'
+      printf 'Phase: %s\nTask: <preflight>\n' "$phase"
+      printf 'Repository: %s\nExpected branch: %s\n' "$expected_remote" "$expected_branch"
+      printf 'Pinned SHA: %s\nCurrent SHA: %s\n\n' "$pinned_sha" "$current_sha"
+      printf 'Observed condition:\nReviewed SHA has advanced with potentially material changes.\n\n'
+      printf 'Repository evidence:\nDiff paths from pinned SHA to current state:\n%b\n\n' "$material_paths"
+      printf 'Relevant accepted-plan section:\nRepository pinning and drift handling.\n\n'
+      printf 'Why continuing would require changing or inventing semantics:\nThe affected changes may alter the assumptions reviewed by Project/Sol.\n\n'
+    else
+      printf 'INFO: reviewed SHA has only documentation or execution-manifest drift; no material path was detected\n'
+    fi
+  fi
+fi
+
+if git_at show-ref --verify --quiet "refs/heads/${integration_branch}"; then
+  integration_sha="$(git_at rev-parse "refs/heads/${integration_branch}")"
+  if [[ "$pinned_sha" =~ ^[0-9a-fA-F]{40}$ ]] && \
+     ! git_at merge-base --is-ancestor "$pinned_sha" "$integration_sha"; then
+    escalation=true
+    printf 'PLAN_ESCALATION\n\n'
+    printf 'Type: MATERIAL_REPO_DRIFT\n'
+    printf 'Phase: %s\nTask: <preflight>\n' "$phase"
+    printf 'Repository: %s\nExpected branch: %s\n' "$expected_remote" "$expected_branch"
+    printf 'Pinned SHA: %s\nCurrent SHA: %s\n\n' "$pinned_sha" "$integration_sha"
+    printf 'Observed condition:\nPhase integration branch is not descended from the pinned SHA.\n\n'
+    printf 'Repository evidence:\n%s\n\n' "$integration_branch"
+    printf 'Relevant accepted-plan section:\nPhase integration branch and repository pinning.\n\n'
+    printf 'Why continuing would require changing or inventing semantics:\nThe integration branch has an unreviewed base.\n\n'
+  fi
+else
+  if [[ "$allow_missing_integration" == true ]]; then
+    printf 'INFO: phase integration branch %s does not exist yet; coordinator may create it from the pinned SHA\n' "$integration_branch"
+  else
+    block "phase integration branch ${integration_branch} does not exist"
+  fi
+fi
+
+for command_name in git bash awk sed grep; do
+  command -v "$command_name" >/dev/null 2>&1 \
+    || block "required command is missing: ${command_name}"
+done
+
+for required_file in \
+  "$REPO_ROOT/AGENTS.md" \
+  "$REPO_ROOT/.codex/config.toml" \
+  "$REPO_ROOT/scripts/agent-worktree" \
+  "$REPO_ROOT/scripts/validate"; do
+  [[ -f "$required_file" ]] || block "required repository tooling is missing: ${required_file#"$REPO_ROOT/"}"
+done
+
+if ((${#errors[@]} > 0)); then
+  printf 'EXECUTION_BLOCKED\n'
+  printf 'Phase: %s\n' "$phase"
+  printf 'Manifest: %s\n' "$manifest"
+  printf 'Expected branch: %s\n' "$expected_branch"
+  printf 'Pinned SHA: %s\n' "$pinned_sha"
+  printf 'Current SHA: %s\n' "$current_sha"
+  printf 'Reasons:\n'
+  printf -- '- %s\n' "${errors[@]}"
+  exit 2
+fi
+
+if [[ "$escalation" == true ]]; then
+  exit 2
+fi
+
+printf 'PHASE_PREFLIGHT_PASS\n'
+printf 'Phase: %s\n' "$phase"
+printf 'Manifest: %s\n' "$manifest"
+printf 'Repository: %s\n' "$expected_remote"
+printf 'Reviewed branch: %s\n' "$expected_branch"
+printf 'Pinned SHA: %s\n' "$pinned_sha"
+printf 'Current branch: %s\n' "$current_branch"
+printf 'Integration branch: %s\n' "$integration_branch"
